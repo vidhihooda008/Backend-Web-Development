@@ -1,3 +1,4 @@
+
 const crypto = require('crypto');
 
 const sessions = new Map();
@@ -13,13 +14,10 @@ function create(userId) {
 
   sessions.set(sid, {
     userId,
-    expiresAt,
+    expiresAt
   });
 
-  return {
-    sid,
-    expiresAt,
-  };
+  return { sid, expiresAt };
 }
 
 function get(sid) {
@@ -52,5 +50,5 @@ function destroy(sid) {
 module.exports = {
   create,
   get,
-  destroy,
+  destroy
 };

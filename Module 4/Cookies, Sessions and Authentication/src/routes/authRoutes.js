@@ -1,3 +1,4 @@
+
 const express = require('express');
 const bcrypt = require('bcryptjs');
 
@@ -8,6 +9,18 @@ const requireSession = require('../middleware/requireSession');
 const router = express.Router();
 
 const COST_FACTOR = 10;
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 3600000);
+
+function cookieOptions() {
+  return {
+    signed: true,
+    httpOnly: true,
+    secure: process.env.COOKIE_SECURE === 'true',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: SESSION_TTL_MS,
+  };
+}
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
@@ -34,6 +47,15 @@ function invalidCredentials(res) {
   });
 }
 
+function authenticationRequired(res) {
+  return res.status(401).json({
+    error: {
+      code: 'AUTH_REQUIRED',
+      message: 'Authentication required',
+    },
+  });
+}
+
 // POST /auth/register
 router.post('/register', async (req, res, next) => {
   try {
@@ -52,16 +74,19 @@ router.post('/register', async (req, res, next) => {
       });
     }
 
-    const normalizedName = name.trim();
-    const normalizedEmail = normalizeEmail(email);
-
-    const existingUser = await prisma.user.findUnique({
-      where: {
-        email: normalizedEmail,
+    const user = await prisma.user.create({
+      data: {
+        name: name.trim(),
+        email: normalizeEmail(email),
+        passwordHash: await bcrypt.hash(password, COST_FACTOR),
       },
     });
 
-    if (existingUser) {
+    return res.status(201).json({
+      data: safeUser(user),
+    });
+  } catch (error) {
+    if (error.code === 'P2002') {
       return res.status(409).json({
         error: {
           code: 'EMAIL_EXISTS',
@@ -70,36 +95,7 @@ router.post('/register', async (req, res, next) => {
       });
     }
 
-    const passwordHash = await bcrypt.hash(password, COST_FACTOR);
-
-    let user;
-
-    try {
-      user = await prisma.user.create({
-        data: {
-          name: normalizedName,
-          email: normalizedEmail,
-          passwordHash,
-        },
-      });
-    } catch (error) {
-      if (error.code === 'P2002') {
-        return res.status(409).json({
-          error: {
-            code: 'EMAIL_EXISTS',
-            message: 'An account with this email already exists',
-          },
-        });
-      }
-
-      throw error;
-    }
-
-    return res.status(201).json({
-      data: safeUser(user),
-    });
-  } catch (error) {
-    next(error);
+    return next(error);
   }
 });
 
@@ -108,10 +104,7 @@ router.post('/login', async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
 
-    if (
-      !isNonEmptyString(email) ||
-      !isNonEmptyString(password)
-    ) {
+    if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
       return res.status(400).json({
         error: {
           code: 'INVALID_INPUT',
@@ -120,12 +113,8 @@ router.post('/login', async (req, res, next) => {
       });
     }
 
-    const normalizedEmail = normalizeEmail(email);
-
     const user = await prisma.user.findUnique({
-      where: {
-        email: normalizedEmail,
-      },
+      where: { email: normalizeEmail(email) },
     });
 
     if (!user) {
@@ -141,21 +130,16 @@ router.post('/login', async (req, res, next) => {
       return invalidCredentials(res);
     }
 
+    // The session store generates and stores the session ID.
     const { sid } = sessionStore.create(user.id);
 
-    res.cookie('sid', sid, {
-      signed: true,
-      httpOnly: true,
-      sameSite: 'lax',
-      maxAge: Number(process.env.SESSION_TTL_MS || 3600000),
-      secure: process.env.COOKIE_SECURE === 'true',
-    });
+    res.cookie('sid', sid, cookieOptions());
 
     return res.status(200).json({
       data: safeUser(user),
     });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 });
 
@@ -163,47 +147,39 @@ router.post('/login', async (req, res, next) => {
 router.get('/me', requireSession, async (req, res, next) => {
   try {
     const user = await prisma.user.findUnique({
-      where: {
-        id: req.userId,
-      },
+      where: { id: req.userId },
     });
 
     if (!user) {
-      return res.status(401).json({
-        error: {
-          code: 'UNAUTHENTICATED',
-          message: 'Authentication required',
-        },
-      });
+      sessionStore.destroy(req.signedCookies?.sid);
+      return authenticationRequired(res);
     }
 
     return res.status(200).json({
       data: safeUser(user),
     });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 });
 
 // POST /auth/logout
-router.post('/logout', async (req, res, next) => {
+router.post('/logout', (req, res, next) => {
   try {
-    const sid = req.signedCookies.sid;
+    const sid = req.signedCookies?.sid;
 
-    if (sid) {
+    if (typeof sid === 'string') {
       sessionStore.destroy(sid);
     }
 
-    res.clearCookie('sid', {
-      signed: true,
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: process.env.COOKIE_SECURE === 'true',
-    });
+    const options = cookieOptions();
+    delete options.maxAge;
+
+    res.clearCookie('sid', options);
 
     return res.status(204).send();
   } catch (error) {
-    next(error);
+    return next(error);
   }
 });
 
